@@ -13,6 +13,27 @@ from emulator_agent.workers import MAX_RESPONSE_BYTES, Worker
 
 
 class CoreTests(unittest.TestCase):
+    def test_ld_key_targets_render_window_and_includes_scan_code(self):
+        from emulator_agent.native import LDNative
+        native = LDNative.__new__(LDNative)
+        native.instance = Instance('ld', 0, 'test', '.', True, 12, 34, 56)
+        native.validate_input_window = Mock()
+        with patch('emulator_agent.native.user') as user, patch('emulator_agent.native.post') as post:
+            user.MapVirtualKeyW.return_value = 0x3B
+            native.key('home')
+        native.validate_input_window.assert_called_once()
+        self.assertEqual(post.call_args_list[0].args, (56, 0x100, 0x70, 0x003B0001))
+        self.assertEqual(post.call_args_list[1].args, (56, 0x101, 0x70, 0xC03B0001))
+
+    def test_ld_unavailable_keys_do_not_send_input(self):
+        from emulator_agent.native import LDNative
+        native = LDNative.__new__(LDNative)
+        with patch('emulator_agent.native.post') as post:
+            for key in ('back', 'enter'):
+                with self.assertRaises(ControlError):
+                    native.key(key)
+            post.assert_not_called()
+
     def test_protocol_limit_covers_maximum_native_frame(self):
         self.assertGreater(MAX_RESPONSE_BYTES, (24_000_000 * 3 + 1_000_000) * 4 // 3)
 
@@ -28,6 +49,15 @@ class CoreTests(unittest.TestCase):
     def test_integer_rejects_bool_and_out_of_bounds(self):
         for value in (True,-1,10,1.5):
             with self.assertRaises(ControlError):integer(value,'x',0,9)
+
+    def test_closing_rejects_lifecycle_request(self):
+        c = Controller.__new__(Controller)
+        c.slots = {}; c.map_lock = threading.Lock()
+        c.closing = threading.Event(); c.closing.set()
+        c.registry = Mock()
+        with self.assertRaises(ControlError):
+            c.set_instance_state('ld:0', 'start')
+        c.registry.lifecycle.assert_not_called()
 
     def controller_stub(self):
         c=Controller.__new__(Controller)

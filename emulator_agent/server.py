@@ -82,7 +82,7 @@ def create_server(root: Path):
 
     @server.tool(structured_output=False)
     async def press_key(instance_id: str, key: str):
-        """发送 back/home/recent/enter；MuMu 另支持 volume_up/volume_down。"""
+        """雷电仅 home/recent；MuMu 支持 back/home/recent/enter/volume_up/volume_down。"""
         return await invoke(controller.action, instance_id, "press_key", key=key)
 
     @server.tool(structured_output=False)

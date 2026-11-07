@@ -130,13 +130,17 @@ class LDNative(Native):
             time.sleep(.05)
         raise ControlError("雷电原生截图未返回画面；请检查实例是否启动完成")
 
-    def touch(self, x: int, y: int):
+    def validate_input_window(self):
         inst = self.instance
         if is_elevated(inst.pid) and not is_elevated():
             raise ControlError("雷电以管理员运行：请以普通权限关闭再启动该实例，或由管理员权限的调用端运行工具")
         if user.IsIconic(inst.hwnd):
             raise ControlError("雷电最小化输入尚未验证，请先还原窗口；遮挡窗口可继续使用")
-        width, height = validate_window(inst.render_hwnd, inst.pid, "RenderWindow")
+        return validate_window(inst.render_hwnd, inst.pid, "RenderWindow")
+
+    def touch(self, x: int, y: int):
+        inst = self.instance
+        width, height = self.validate_input_window()
         if not self.touch_active:
             self.client_size = (width, height)
         if self.client_size != (width, height):
@@ -158,17 +162,19 @@ class LDNative(Native):
                 self.touch_active = False
 
     def key(self, key: str):
-        values = {"back": 0x1B, "home": 0x70, "recent": 0x71, "enter": 0x0D}
+        values = {"home": 0x70, "recent": 0x71}
         if key not in values:
-            raise ControlError("不支持的按键")
+            raise ControlError("雷电首版仅支持 home/recent；后台返回键实测无效，回车未验证，请按截图点击应用内控件")
         inst = self.instance
-        validate_window(inst.hwnd, inst.pid, "LDPlayerMainFrame")
+        self.validate_input_window()
         code = values[key]
-        post(inst.hwnd, 0x100, code, 1)
+        params = 1 | (user.MapVirtualKeyW(code, 0) << 16)
+        # The top-level frame accepts messages but does not deliver keys to Android.
+        post(inst.render_hwnd, 0x100, code, params)
         try:
             time.sleep(.05)
         finally:
-            post(inst.hwnd, 0x101, code, 0xC0000001)
+            post(inst.render_hwnd, 0x101, code, params | 0xC0000000)
 
     def close(self):
         try:

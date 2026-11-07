@@ -57,6 +57,8 @@ class Controller:
         result = instance.public()
         result["capabilities"] = {"screenshot": True, "click": True, "long_press": True,
                                   "swipe": True, "press_key": True, "input_text": instance.vendor == "mumu"}
+        result["supported_keys"] = (["home", "recent"] if instance.vendor == "ld" else
+                                    ["back", "home", "recent", "enter", "volume_up", "volume_down"])
         if instance.running and instance.vendor == "ld":
             result["requires_elevation"] = is_elevated(instance.pid) and not is_elevated()
         result["business_success_requires_visual_verification"] = True
@@ -176,6 +178,8 @@ class Controller:
         slot = self.slot(instance_id)
         self.cancel(instance_id)
         with slot.lock:
+            if self.closing.is_set():
+                raise ControlError("工具正在关闭，已停止接受实例启停")
             instance = self.registry.get(instance_id)
             if slot.worker:
                 slot.worker.close()
