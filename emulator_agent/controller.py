@@ -49,12 +49,21 @@ class Controller:
             return self.slots.setdefault(instance_id, Slot())
 
     def list_instances(self):
-        return [i.public() for i in self.registry.list()]
+        result = []
+        for vendor in self.registry.roots:
+            try:
+                result.extend(i.public() for i in self.registry.list(vendor))
+            except ControlError as exc:
+                result.append({"vendor": vendor, "instance_id": None, "running": None,
+                               "state": "query_failed", "error": str(exc)})
+        return result
 
     def get_instance(self, instance_id):
+        from . import __version__
         from .win32 import is_elevated
         instance = self.registry.get(instance_id)
         result = instance.public()
+        result["tool_version"] = __version__
         result["capabilities"] = {"screenshot": True, "click": True, "long_press": True,
                                   "swipe": True, "press_key": True, "input_text": instance.vendor == "mumu"}
         result["supported_keys"] = (["home", "recent"] if instance.vendor == "ld" else
@@ -68,8 +77,10 @@ class Controller:
         if self.closing.is_set():
             raise ControlError("工具正在关闭，已停止接受新操作")
         current = self.registry.get(instance_id)
-        if not current.running:
-            raise ControlError("模拟器尚未启动，请先 set_instance_state(start)")
+        if current.state != "running":
+            if current.state == "stopped":
+                raise ControlError("管理程序报告实例已停止；确认需要运行时再 set_instance_state(start)")
+            raise ControlError(current.state_message)
         existing = slot.worker
         if existing and (not existing.alive or existing.instance.generation != current.generation
                          or (current.width and (existing.instance.width, existing.instance.height) != (current.width, current.height))):
@@ -81,20 +92,23 @@ class Controller:
         return slot.worker
 
     def log(self, instance_id, operation, status, elapsed):
-        folder = self.root / "runtime/logs"
-        folder.mkdir(parents=True, exist_ok=True)
-        now = datetime.now(timezone.utc)
-        record = {"time": now.isoformat(), "instance": instance_id, "operation": operation,
-                  "status": status, "elapsed_ms": round(elapsed * 1000)}
-        with self.log_lock:
-            with (folder / f"{now:%Y-%m-%d}.jsonl").open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        try:
+            folder = self.root / "runtime/logs"
+            folder.mkdir(parents=True, exist_ok=True)
+            now = datetime.now(timezone.utc)
+            record = {"time": now.isoformat(), "instance": instance_id, "operation": operation,
+                      "status": status, "elapsed_ms": round(elapsed * 1000)}
+            with self.log_lock:
+                with (folder / f"{now:%Y-%m-%d}.jsonl").open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError:
+            return "操作日志写入失败；操作结果仍有效，请勿因此重复输入或启停"
 
     def render_frame(self, slot, instance_id, result, crop=None, max_size=1600):
         if "png" not in result:
             return result
         full_size = (result["width"], result["height"])
-        image = Image.open(BytesIO(base64.b64decode(result.pop("png"))))
+        png = base64.b64decode(result.pop("png"))
         box = (0, 0, *full_size)
         if crop is not None:
             if len(crop) != 4:
@@ -105,19 +119,24 @@ class Controller:
             integer(right, "right", left+1, full_size[0])
             integer(bottom, "bottom", top+1, full_size[1])
             box = tuple(crop)
-            image = image.crop(box)
-        image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-        data = BytesIO()
-        image.save(data, "PNG")
+        view_size = full_size
+        if box != (0, 0, *full_size) or max(full_size) > max_size:
+            with Image.open(BytesIO(png)) as source:
+                image = source.crop(box)
+                image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+                data = BytesIO()
+                image.save(data, "PNG")
+                png = data.getvalue()
+                view_size = image.size
         frame_id = uuid.uuid4().hex
         slot.frames[frame_id] = {"generation": slot.worker.instance.generation, "size": full_size,
-                                 "box": box, "view_size": image.size}
+                                 "box": box, "view_size": view_size}
         while len(slot.frames) > 16:
             slot.frames.popitem(last=False)
-        result.update(instance_id=instance_id, frame_id=frame_id, width=image.width, height=image.height,
+        result.update(instance_id=instance_id, frame_id=frame_id, width=view_size[0], height=view_size[1],
                       native_width=full_size[0], native_height=full_size[1], crop=list(box),
                       captured_at=datetime.now(timezone.utc).isoformat(), coordinate_space="returned_image",
-                      image_bytes=data.getvalue())
+                      image_bytes=png)
         return result
 
     def screenshot(self, instance_id, crop=None, max_size=1600):
@@ -127,10 +146,13 @@ class Controller:
             worker = self.worker(slot, instance_id)
             start = time.monotonic()
             result = worker.request({"op": "screenshot"})
-            self.log(instance_id, "screenshot", result["status"], time.monotonic()-start)
+            warning = self.log(instance_id, "screenshot", result["status"], time.monotonic()-start)
+            if warning:
+                result.setdefault("warnings", []).append(warning)
             return self.render_frame(slot, instance_id, result, crop, max_size)
 
-    def action(self, instance_id, op, *, frame_id=None, points=None, duration=.06, count=1, key=None, text=None):
+    def action(self, instance_id, op, *, frame_id=None, points=None, duration=.06, count=1, key=None, text=None,
+               cancelled=None):
         if op not in ("click", "long_press", "swipe", "press_key", "input_text"):
             raise ControlError("不支持的动作")
         if not isinstance(duration, (int, float)) or isinstance(duration, bool) or not .01 <= duration <= 10:
@@ -142,8 +164,9 @@ class Controller:
             raise ControlError("文本长度应为 1 到 4096，且不得包含空字符")
         slot = self.slot(instance_id)
         epoch = slot.cancel_epoch
+        is_cancelled = lambda: self.closing.is_set() or epoch != slot.cancel_epoch or (cancelled is not None and cancelled.is_set())
         with slot.lock:
-            if epoch != slot.cancel_epoch:
+            if is_cancelled():
                 raise ControlError("排队中的操作已取消")
             worker = self.worker(slot, instance_id)
             request = {"op": op, "duration": duration, "count": count, "key": key, "text": text}
@@ -165,38 +188,49 @@ class Controller:
             slot.frames.clear()
             start = time.monotonic()
             try:
-                result = worker.request(request, slot.start_lock, lambda: epoch != slot.cancel_epoch)
+                result = worker.request(request, slot.start_lock, is_cancelled)
             except Exception:
                 self.log(instance_id, op, "failed_or_unknown", time.monotonic()-start)
                 raise
-            self.log(instance_id, op, result["status"], time.monotonic()-start)
+            warning = self.log(instance_id, op, result["status"], time.monotonic()-start)
+            if warning:
+                result.setdefault("warnings", []).append(warning)
             return self.render_frame(slot, instance_id, result)
 
-    def set_instance_state(self, instance_id, state):
+    def set_instance_state(self, instance_id, state, *, cancelled=None):
         if state not in ("start", "stop", "restart"):
             raise ControlError("state 只能为 start、stop、restart")
         slot = self.slot(instance_id)
-        self.cancel(instance_id)
+        _, epoch = self._cancel(slot)
+        is_cancelled = lambda: self.closing.is_set() or epoch != slot.cancel_epoch or (cancelled is not None and cancelled.is_set())
         with slot.lock:
             if self.closing.is_set():
                 raise ControlError("工具正在关闭，已停止接受实例启停")
+            if is_cancelled():
+                raise ControlError("排队中的启停请求已取消，未发送管理命令")
             instance = self.registry.get(instance_id)
             if slot.worker:
                 slot.worker.close()
                 slot.worker = None
             slot.frames.clear()
             start = time.monotonic()
-            result = self.registry.lifecycle(instance, state)
-            self.log(instance_id, state, "state_observed", time.monotonic()-start)
-            return result.public()
+            result = self.registry.lifecycle(instance, state, start_lock=slot.start_lock, is_cancelled=is_cancelled).public()
+            warning = self.log(instance_id, state, "state_observed", time.monotonic()-start)
+            if warning:
+                result.setdefault("warnings", []).append(warning)
+            return result
 
-    def cancel(self, instance_id):
-        slot = self.slot(instance_id)
+    def _cancel(self, slot):
         with slot.start_lock:
             slot.cancel_epoch += 1
             active = slot.worker.cancel() if slot.worker else False
+            return active, slot.cancel_epoch
+
+    def cancel(self, instance_id):
+        slot = self.slot(instance_id)
+        active, _ = self._cancel(slot)
         return {"instance_id": instance_id, "status": "cancel_requested", "was_active": active,
-                "message": "持续触控将在下一动作步释放；当前操作的返回结果表示最终状态"}
+                "message": "持续触控将释放，排队输入和启停将取消；已发出的输入或管理命令不能撤销，重启可能停在关闭阶段，请查询实际状态"}
 
     def close(self):
         self.closing.set()

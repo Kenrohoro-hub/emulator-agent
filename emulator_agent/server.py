@@ -4,6 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import json
 from pathlib import Path
+import threading
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent, ToolAnnotations
@@ -24,15 +25,21 @@ def create_server(root: Path):
 
     server = FastMCP("emulator-agent", lifespan=lifespan, instructions=(
         "控制本机雷电与 MuMu，全程不使用 ADB。先 list_instances 再 screenshot。"
+        "以 state 判断可操作性；unknown/query_failed 时先检查环境或错误，不要重复启停。"
         "点击坐标必须引用截图返回的 frame_id，坐标以返回图片为准。每次操作后使用新 frame_id。"
         "input_sent 仅表示输入已发出，不表示业务成功，请根据返回画面判断。"
         "超时或结果未知时，先截图，禁止盲目重复点击。"))
 
     async def invoke(fn, *args, **kwargs):
+        cancelled = threading.Event()
+        has_side_effect = fn in (controller.action, controller.set_instance_state)
+        if has_side_effect:
+            kwargs["cancelled"] = cancelled
         try:
             result = await asyncio.to_thread(fn, *args, **kwargs)
         except asyncio.CancelledError:
-            if fn == controller.action and args:
+            cancelled.set()
+            if has_side_effect and args:
                 controller.cancel(args[0])
             raise
         if isinstance(result, dict) and "image_bytes" in result:
@@ -46,7 +53,7 @@ def create_server(root: Path):
 
     @server.tool(annotations=read, structured_output=False)
     async def list_instances():
-        """列出雷电、MuMu 实例和运行状态，不会启动实例。"""
+        """列出实例及 state；单个厂商查询失败以 state=query_failed 返回，不影响另一个厂商。"""
         return await invoke(controller.list_instances)
 
     @server.tool(annotations=read, structured_output=False)
@@ -92,7 +99,7 @@ def create_server(root: Path):
 
     @server.tool(structured_output=False)
     async def cancel(instance_id: str):
-        """取消指定实例持续输入与排队操作；不关闭模拟器。"""
+        """取消持续触控、排队输入与尚未派发的启停；已发出的管理命令不能撤销，请查询状态。"""
         return await invoke(controller.cancel, instance_id)
 
     return server

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -21,19 +22,31 @@ def decode(data: bytes) -> str:
     raise ControlError("模拟器命令输出编码无法识别")
 
 
-def run_command(executable: Path, *args: str, timeout: float = 15) -> str:
+def run_command(executable: Path, *args: str, timeout: float = 15,
+                start_lock=None, is_cancelled=None) -> str:
     try:
-        result = subprocess.run(
-            [str(executable), *args], capture_output=True, timeout=timeout,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        with start_lock if start_lock is not None else nullcontext():
+            if is_cancelled is not None and is_cancelled():
+                raise ControlError("启停请求已取消，未发送后续管理命令；已发出的命令不能撤销，请查询实例状态")
+            process = subprocess.Popen(
+                [str(executable), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        with process:
+            try:
+                output, _ = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # Reap only the management command created above, never the emulator.
+                process.kill()
+                process.communicate()
+                raise
     except subprocess.TimeoutExpired as exc:
         raise ControlError("模拟器管理命令超时；请查询实际状态，不要直接重复操作") from exc
     except OSError as exc:
         raise ControlError(f"无法运行模拟器管理程序：{exc}") from exc
-    if result.returncode:
-        raise ControlError(f"模拟器管理命令失败（退出码 {result.returncode}）")
-    return decode(result.stdout).strip()
+    if process.returncode:
+        raise ControlError(f"模拟器管理命令失败（退出码 {process.returncode}）")
+    return decode(output).strip()
 
 
 @dataclass
@@ -48,6 +61,24 @@ class Instance:
     render_hwnd: int = 0
     width: int = 0
     height: int = 0
+    query_restricted: bool = False
+
+    @property
+    def state(self) -> str:
+        if self.running:
+            return "running" if self.pid and self.render_hwnd else "starting"
+        if self.query_restricted or self.pid or self.hwnd or self.render_hwnd:
+            return "unknown"
+        return "stopped"
+
+    @property
+    def state_message(self) -> str:
+        return {
+            "running": "管理程序报告 Android 正在运行；实际画面以截图为准",
+            "starting": "Android 正在启动或渲染窗口未就绪，请稍后查询或截图，不要重复启动",
+            "unknown": "无法确认运行状态：可能正在启停，或查询受沙箱/桌面会话限制；请检查调用环境，不要重复启停",
+            "stopped": "管理程序报告实例已停止，且未返回进程或窗口",
+        }[self.state]
 
     @property
     def id(self) -> str:
@@ -61,6 +92,7 @@ class Instance:
         result = asdict(self)
         result.pop("root")
         result["instance_id"] = self.id
+        result.update(state=self.state, state_message=self.state_message)
         return result
 
 
@@ -82,6 +114,14 @@ def parse_ld(text: str, root: Path) -> list[Instance]:
 
 
 def parse_mumu(text: str, root: Path) -> list[Instance]:
+    def number(value, base=10):
+        if type(value) is not int and not isinstance(value, str):
+            raise ValueError("Expected an integer or integer string")
+        parsed = int(value, base) if isinstance(value, str) else value
+        if parsed < 0:
+            raise ValueError("Expected a non-negative integer")
+        return parsed
+
     decoder = json.JSONDecoder()
     records = []
     while text.strip():
@@ -89,9 +129,13 @@ def parse_mumu(text: str, root: Path) -> list[Instance]:
             obj, offset = decoder.raw_decode(text.lstrip())
         except json.JSONDecodeError as exc:
             raise ControlError("MuMu 实例查询未返回有效 JSON") from exc
+        if not isinstance(obj, (dict, list)):
+            raise ControlError("不支持的 MuMu 实例格式")
         records.extend(obj if isinstance(obj, list) else [obj])
         text = text.lstrip()[offset:]
-    if len(records) == 1 and "index" not in records[0]:
+    if len(records) == 1 and isinstance(records[0], dict) and "index" not in records[0]:
+        if records[0].get("error_code", 0):
+            raise ControlError(f"MuMu 实例查询失败：{records[0]['error_code']}")
         records = list(records[0].values())
     result = []
     for obj in records:
@@ -99,12 +143,15 @@ def parse_mumu(text: str, root: Path) -> list[Instance]:
             raise ControlError("不支持的 MuMu 实例格式")
         if obj.get("error_code", 0):
             raise ControlError(f"MuMu 实例查询失败：{obj['error_code']}")
-        def hwnd(key):
-            value = obj.get(key, 0)
-            return int(value, 16) if isinstance(value, str) else int(value)
-        result.append(Instance("mumu", int(obj["index"]), str(obj.get("name", "MuMu")),
-                               str(root), bool(obj.get("is_android_started")),
-                               int(obj.get("pid", 0)), hwnd("main_wnd"), hwnd("render_wnd")))
+        running = obj.get("is_android_started", False)
+        if not isinstance(running, bool):
+            raise ControlError("MuMu 实例信息包含无效运行标记")
+        try:
+            result.append(Instance("mumu", number(obj["index"]), str(obj.get("name", "MuMu")),
+                                   str(root), running, number(obj.get("pid", 0)),
+                                   number(obj.get("main_wnd", 0), 16), number(obj.get("render_wnd", 0), 16)))
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise ControlError("MuMu 实例信息包含无效数字") from exc
     return result
 
 
@@ -162,48 +209,65 @@ def discover_roots(config_file: Path | None = None) -> dict[str, Path]:
 
 class Registry:
     def __init__(self, config_file: Path | None = None):
+        from .win32 import is_restricted
         self.roots = discover_roots(config_file)
+        self.query_restricted = is_restricted()
 
-    def list(self) -> list[Instance]:
-        instances = []
-        for vendor, root in self.roots.items():
-            if vendor == "ld":
-                instances.extend(parse_ld(run_command(root / "ldconsole.exe", "list2"), root))
-            else:
-                instances.extend(parse_mumu(run_command(root / "nx_main/MuMuManager.exe", "info", "--vmindex", "all"), root))
+    def list(self, vendor: str) -> list[Instance]:
+        if vendor not in self.roots:
+            raise ControlError(f"未发现 {vendor} 安装，请检查安装记录或 config.local.json")
+        root = self.roots[vendor]
+        if vendor == "ld":
+            instances = parse_ld(run_command(root / "ldconsole.exe", "list2"), root)
+        else:
+            instances = parse_mumu(run_command(root / "nx_main/MuMuManager.exe", "info", "--vmindex", "all"), root)
+        for instance in instances:
+            instance.query_restricted = self.query_restricted
         return instances
 
     def get(self, instance_id: str) -> Instance:
-        if not isinstance(instance_id, str) or not instance_id.split(":")[-1].isdigit():
+        parts = instance_id.split(":") if isinstance(instance_id, str) else []
+        if len(parts) != 2 or parts[0] not in ("ld", "mumu") or not parts[1].isdigit():
             raise ControlError("实例标识应为 ld:0 或 mumu:0")
-        for instance in self.list():
+        for instance in self.list(parts[0]):
             if instance.id == instance_id:
                 return instance
         raise ControlError(f"未找到实例 {instance_id}")
 
-    def lifecycle(self, instance: Instance, state: str):
+    def lifecycle(self, instance: Instance, state: str, *, start_lock=None, is_cancelled=None):
         import time
+        def check_cancelled():
+            if is_cancelled is not None and is_cancelled():
+                raise ControlError("启停请求已取消；已发出的命令不能撤销，重启可能停在关闭阶段，请查询实例状态")
+
         if state not in ("start", "stop", "restart"):
             raise ControlError("state 只能为 start、stop、restart")
+        check_cancelled()
+        if instance.state == "unknown" or (state == "start" and instance.state == "starting"):
+            raise ControlError(instance.state_message)
         if state == "restart":
-            self.lifecycle(instance, "stop")
-            return self.lifecycle(self.get(instance.id), "start")
-        if instance.running == (state == "start"):
+            self.lifecycle(instance, "stop", start_lock=start_lock, is_cancelled=is_cancelled)
+            check_cancelled()
+            return self.lifecycle(self.get(instance.id), "start", start_lock=start_lock, is_cancelled=is_cancelled)
+        if instance.state == ("running" if state == "start" else "stopped"):
             return instance
         root = Path(instance.root)
         if instance.vendor == "ld":
-            run_command(root / "ldconsole.exe", "launch" if state == "start" else "quit", "--index", str(instance.index))
+            run_command(root / "ldconsole.exe", "launch" if state == "start" else "quit", "--index", str(instance.index),
+                        start_lock=start_lock, is_cancelled=is_cancelled)
         else:
             output = run_command(root / "nx_main/MuMuManager.exe", "control", "--vmindex", str(instance.index),
-                                 "launch" if state == "start" else "shutdown")
+                                 "launch" if state == "start" else "shutdown", start_lock=start_lock, is_cancelled=is_cancelled)
             if output:
                 reply = json.loads(output)
                 if reply.get("errcode", 0):
                     raise ControlError(f"MuMu 管理操作失败：{reply['errcode']}")
         deadline = time.monotonic() + (90 if state == "start" else 40)
         while time.monotonic() < deadline:
+            check_cancelled()
             current = self.get(instance.id)
-            if current.running == (state == "start") and (state == "stop" or current.render_hwnd):
+            check_cancelled()
+            if current.state == ("running" if state == "start" else "stopped"):
                 return current
             time.sleep(.5)
         raise ControlError("实例状态等待超时；请先查询状态，避免重复启停")

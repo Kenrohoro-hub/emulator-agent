@@ -62,7 +62,8 @@ class CoreTests(unittest.TestCase):
     def controller_stub(self):
         c=Controller.__new__(Controller)
         c.slots={};c.map_lock=threading.Lock()
-        c.log=Mock()
+        c.log=Mock(return_value=None)
+        c.closing=threading.Event()
         instance=Instance('mumu',0,'test','.',True,12,34,56)
         w=Mock();w.instance=instance
         c.worker=Mock(return_value=w)

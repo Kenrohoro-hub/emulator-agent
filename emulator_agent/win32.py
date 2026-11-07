@@ -31,6 +31,22 @@ signature(kernel, "GetCurrentProcess", W.HANDLE)
 signature(kernel, "CloseHandle", W.BOOL, W.HANDLE)
 signature(advapi, "OpenProcessToken", W.BOOL, W.HANDLE, W.DWORD, C.POINTER(W.HANDLE))
 signature(advapi, "GetTokenInformation", W.BOOL, W.HANDLE, C.c_int, C.c_void_p, W.DWORD, C.POINTER(W.DWORD))
+signature(advapi, "IsTokenRestricted", W.BOOL, W.HANDLE)
+
+
+def is_restricted() -> bool:
+    token = W.HANDLE()
+    try:
+        if not advapi.OpenProcessToken(kernel.GetCurrentProcess(), 8, C.byref(token)):
+            raise ControlError("无法读取当前进程令牌，不能判断查询环境")
+        C.set_last_error(0)
+        restricted = advapi.IsTokenRestricted(token)
+        if not restricted and C.get_last_error():
+            raise ControlError("无法判断当前查询是否受限")
+        return bool(restricted)
+    finally:
+        if token:
+            kernel.CloseHandle(token)
 
 
 def is_elevated(pid: int = 0) -> bool:

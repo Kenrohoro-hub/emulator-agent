@@ -23,10 +23,13 @@ def main():
     controller = Controller(root)
     try:
         if args.command == "doctor":
-            from .win32 import is_elevated
+            from . import __version__
+            from .win32 import is_elevated, is_restricted
             result = {"project": str(root), "python": sys.version.split()[0], "elevated": is_elevated(),
+                      "tool_version": __version__, "query_restricted": is_restricted(),
                       "installations": {k:str(v) for k,v in controller.registry.roots.items()},
-                      "instances": [controller.get_instance(i["instance_id"]) for i in controller.list_instances()]}
+                      "instances": [controller.get_instance(i["instance_id"]) if i["instance_id"] else i
+                                    for i in controller.list_instances()]}
         elif args.command == "list":
             result = controller.list_instances()
         elif args.command == "state":
