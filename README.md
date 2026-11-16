@@ -1,4 +1,4 @@
-# 模拟器 Agent 控制器（emulator-agent）
+# NoADB Emu MCP（无 ADB 模拟器控制桥）
 
 一个运行在 Windows 本机的 MCP 工具，让支持图片输入的 Agent 不通过 ADB 操作雷电和 MuMu 模拟器：先查看截图，再执行点击、滑动等操作并检查新画面。本项目提供的是控制能力，不包含游戏任务脚本；具体任务由调用方决定。
 
@@ -45,7 +45,14 @@
 
 ## 启动
 
-先从 GitHub 克隆仓库，或下载 ZIP 并解压，然后进入项目目录。
+从 GitHub 克隆仓库：
+
+```bat
+git clone https://github.com/Kenrohoro-hub/noadb-emu-mcp.git
+cd noadb-emu-mcp
+```
+
+也可以下载 ZIP 并解压，然后进入解压后的项目目录。
 
 双击项目根目录的 `run-app.cmd`，会准备独立运行环境、显示诊断信息，并生成 `runtime/mcp-config.json`。首次失败时保留错误窗口；再次运行会检查并修复缺失的依赖。
 
@@ -66,6 +73,8 @@ run-app.cmd state mumu:0 --state start
 ## 接入 Agent
 
 将 `runtime/mcp-config.json` 的 `emulator-agent` 配置添加到 Agent 的 MCP 设置，然后重新加载 MCP 服务。该配置已经包含当前机器的实际项目路径和 Python 路径，不需要手工替换中文目录。
+
+项目已更名为 NoADB Emu MCP；为保持现有接入可用，MCP 配置项、服务标识和命令行入口仍使用 `emulator-agent`，Python 模块名仍为 `emulator_agent`。本次更名不要求修改现有的客户端配置或移动项目目录。
 
 不同 Agent 的配置文件结构可能不同；本项目生成的是常见 `mcpServers` JSON 格式。配置的实质是启动项目 `.venv` 内的 Python，执行 `main.py serve`，采用 stdio 通信，不监听网络端口。
 

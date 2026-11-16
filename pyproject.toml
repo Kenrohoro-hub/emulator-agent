@@ -1,7 +1,7 @@
 [project]
-name = "emulator-agent"
+name = "noadb-emu-mcp"
 version = "0.1.1"
-description = "Local no-ADB controller for LDPlayer and MuMu"
+description = "Local no-ADB MCP controller for LDPlayer and MuMu"
 requires-python = ">=3.11"
 dependencies = ["mcp>=1.30,<2", "Pillow>=12,<13"]
 
