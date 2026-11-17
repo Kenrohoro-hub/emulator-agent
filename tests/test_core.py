@@ -1,6 +1,8 @@
 from collections import OrderedDict
 from io import BytesIO
+import json
 from pathlib import Path
+import sys
 import threading
 import unittest
 from unittest.mock import Mock, patch
@@ -8,7 +10,7 @@ from unittest.mock import Mock, patch
 from PIL import Image
 
 from emulator_agent.controller import Controller, Slot, integer
-from emulator_agent.discovery import ControlError, Instance, parse_ld, parse_mumu
+from emulator_agent.discovery import ControlError, Instance, parse_ld, parse_mumu, run_command
 from emulator_agent.workers import MAX_RESPONSE_BYTES, Worker
 
 
@@ -33,6 +35,81 @@ class CoreTests(unittest.TestCase):
                 with self.assertRaises(ControlError):
                     native.key(key)
             post.assert_not_called()
+
+    def test_ld_text_uses_official_command_with_exact_argument(self):
+        from emulator_agent.native import LDNative
+        native = LDNative.__new__(LDNative)
+        native.instance = Instance('ld', 2, 'test', 'C:/fake emulator', True, 12, 34, 56)
+        native.validate_input_window = Mock()
+        process = Mock()
+        process.__enter__ = Mock(return_value=process)
+        process.__exit__ = Mock(return_value=False)
+        process.communicate.return_value = (b'', b'')
+        process.returncode = 0
+        value = r'测试 "quoted" & 100% \ path'
+        with patch('emulator_agent.discovery.subprocess.Popen', return_value=process) as spawn:
+            native.text(value)
+        native.validate_input_window.assert_called_once()
+        self.assertEqual(spawn.call_args.args[0], [str(Path(native.instance.root) / 'ldconsole.exe'),
+                         'action', '--index', '2', '--key', 'call.input', '--value', value])
+        self.assertFalse(spawn.call_args.kwargs.get('shell', False))
+        process.communicate.assert_called_once_with(timeout=8)
+
+    def test_windows_process_passes_special_text_without_shell(self):
+        value = r'测试 "quoted" & 100% \ path'
+        code = 'import json,sys; print(json.dumps(sys.argv[1:]))'
+        output = run_command(Path(sys.executable), '-c', code, value)
+        self.assertEqual(json.loads(output), [value])
+
+    def test_ld_text_action_returns_new_frame_and_unverified_status(self):
+        from emulator_agent.native import LDNative
+        native = LDNative.__new__(LDNative)
+        native.instance = Instance('ld', 0, 'test', '.', True, 12, 34, 56)
+        native.validate_input_window = Mock()
+        native.screenshot = Mock(return_value=Image.new('RGB', (2, 2)))
+        cancelled = Mock()
+        cancelled.is_set.return_value = False
+        with patch('emulator_agent.native.run_command') as command:
+            result = native.execute({'op': 'input_text', 'text': 'example'}, cancelled)
+        command.assert_called_once()
+        self.assertEqual(native.screenshot.call_count, 2)
+        self.assertEqual(result['status'], 'input_sent')
+        self.assertFalse(result['task_verified'])
+        self.assertIn('png', result)
+
+    def test_ld_text_failure_does_not_retry_or_expose_value(self):
+        from emulator_agent.native import LDNative
+        native = LDNative.__new__(LDNative)
+        native.instance = Instance('ld', 0, 'test', '.', True, 12, 34, 56)
+        native.validate_input_window = Mock()
+        with patch('emulator_agent.native.run_command', side_effect=ControlError('timeout')) as command:
+            with self.assertRaisesRegex(ControlError, '结果可能未知') as error:
+                native.text('private-example')
+        command.assert_called_once()
+        self.assertNotIn('private-example', str(error.exception))
+
+    def test_ld_text_refuses_invalid_window_before_dispatch(self):
+        from emulator_agent.native import LDNative
+        native = LDNative.__new__(LDNative)
+        native.validate_input_window = Mock(side_effect=ControlError('invalid window'))
+        with patch('emulator_agent.native.run_command') as command:
+            with self.assertRaises(ControlError):
+                native.text('example')
+        command.assert_not_called()
+
+    def test_text_capability_for_both_vendors_and_mumu_utf8(self):
+        from emulator_agent.native import MuMuNative
+        c = Controller.__new__(Controller)
+        c.registry = Mock()
+        for vendor in ('ld', 'mumu'):
+            with self.subTest(vendor=vendor):
+                c.registry.get.return_value = Instance(vendor, 0, 'test', '.', False)
+                self.assertTrue(c.get_instance(f'{vendor}:0')['capabilities']['input_text'])
+        native = MuMuNative.__new__(MuMuNative)
+        native.checked = Mock()
+        native.text('测试 A')
+        value = '测试 A'.encode('utf-8')
+        native.checked.assert_called_once_with('nemu_input_text', len(value), value)
 
     def test_protocol_limit_covers_maximum_native_frame(self):
         self.assertGreater(MAX_RESPONSE_BYTES, (24_000_000 * 3 + 1_000_000) * 4 // 3)

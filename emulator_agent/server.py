@@ -24,7 +24,7 @@ def create_server(root: Path):
             await asyncio.to_thread(controller.close)
 
     server = FastMCP("emulator-agent", lifespan=lifespan, instructions=(
-        "控制本机雷电与 MuMu，全程不使用 ADB。先 list_instances 再 screenshot。"
+        "控制本机雷电与 MuMu；工具自身不调用 ADB。先 list_instances 再 screenshot。"
         "以 state 判断可操作性；unknown/query_failed 时先检查环境或错误，不要重复启停。"
         "点击坐标必须引用截图返回的 frame_id，坐标以返回图片为准。每次操作后使用新 frame_id。"
         "input_sent 仅表示输入已发出，不表示业务成功，请根据返回画面判断。"
@@ -94,7 +94,7 @@ def create_server(root: Path):
 
     @server.tool(structured_output=False)
     async def input_text(instance_id: str, text: str):
-        """使用 MuMu 原生接口输入 UTF-8 文本。雷电尚未验证此能力，会明确拒绝。"""
+        """输入文本；雷电使用官方命令，文本可能暴露在本机进程参数中，不适合敏感内容。"""
         return await invoke(controller.action, instance_id, "input_text", text=text)
 
     @server.tool(structured_output=False)

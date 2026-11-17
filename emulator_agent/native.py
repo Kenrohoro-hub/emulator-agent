@@ -7,7 +7,7 @@ import time
 
 from PIL import Image
 
-from .discovery import ControlError, Instance
+from .discovery import ControlError, Instance, run_command
 from .win32 import is_elevated, post, signature, user, validate_window
 
 
@@ -175,6 +175,14 @@ class LDNative(Native):
             time.sleep(.05)
         finally:
             post(inst.render_hwnd, 0x101, code, params | 0xC0000000)
+
+    def text(self, text: str):
+        self.validate_input_window()
+        try:
+            run_command(Path(self.instance.root) / "ldconsole.exe", "action", "--index", str(self.instance.index),
+                        "--key", "call.input", "--value", text, timeout=8)
+        except ControlError as exc:
+            raise ControlError(f"雷电文本输入失败，结果可能未知；请先截图，勿直接重复输入（{exc}）") from exc
 
     def close(self):
         try:

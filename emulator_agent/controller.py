@@ -65,7 +65,7 @@ class Controller:
         result = instance.public()
         result["tool_version"] = __version__
         result["capabilities"] = {"screenshot": True, "click": True, "long_press": True,
-                                  "swipe": True, "press_key": True, "input_text": instance.vendor == "mumu"}
+                                  "swipe": True, "press_key": True, "input_text": True}
         result["supported_keys"] = (["home", "recent"] if instance.vendor == "ld" else
                                     ["back", "home", "recent", "enter", "volume_up", "volume_down"])
         if instance.running and instance.vendor == "ld":
